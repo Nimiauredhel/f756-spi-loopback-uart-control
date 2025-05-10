@@ -8,7 +8,8 @@
 #ifndef UTILS_SPI_IO_H_
 #define UTILS_SPI_IO_H_
 
-#define SPI_BUFF_SIZE 255
+#define SPI_DATA_MAX_LEN (64u)
+#define SPI_REG_COUNT (2u)
 
 #include <stdbool.h>
 #include <string.h>
@@ -44,21 +45,38 @@ typedef enum SPIDeviceState
 	SPISTATE_SELECTED = 0x20,
 } SPIDeviceState_t;
 
+typedef struct SPIHeader
+{
+	uint8_t pad_head[2];
+	uint8_t opcode;
+	uint8_t tx_reg;
+	uint8_t tx_len;
+	uint8_t rx_reg;
+	uint8_t rx_len;
+	uint8_t pad_tail[1];
+} SPIHeader_t;
+
+typedef struct SPIPacket
+{
+	SPIHeader_t header;
+	uint8_t data[SPI_DATA_MAX_LEN];
+} SPIPacket_t;
+
 typedef struct SPIDevice
 {
 	SPI_HandleTypeDef *handle;
 	GPIO_TypeDef *cs_port_in;
 	GPIO_TypeDef *cs_port_out;
+	struct SPIDevice *target_device;
 	uint16_t cs_pin_in;
 	uint16_t cs_pin_out;
 	volatile SPIDeviceState_t state;
 	volatile SPIOperation_t op;
 	volatile uint8_t tx_pos;
-	volatile uint8_t tx_len;
 	volatile uint8_t rx_pos;
-	volatile uint8_t rx_len;
-	volatile uint8_t tx_buff[SPI_BUFF_SIZE];
-	volatile uint8_t rx_buff[SPI_BUFF_SIZE];
+	volatile SPIPacket_t tx_buff;
+	volatile SPIPacket_t rx_buff;
+	volatile char regs[SPI_REG_COUNT][SPI_DATA_MAX_LEN];
 	char name[8];
 } SPIDevice_t;
 
@@ -69,7 +87,7 @@ extern SPI_HandleTypeDef hspi5;
 bool spi_io_is_initialized(void);
 void spi_io_initialize(void);
 SPIDevice_t* hspi_to_struct(SPI_HandleTypeDef *hspi);
-bool spi_io_transmit(SPI_HandleTypeDef *hspi, uint8_t *data, uint8_t len);
-bool spi_io_receive(SPI_HandleTypeDef *hspi, uint8_t max_len);
+bool spi_io_transmit(SPIDevice_t *spid, uint8_t *data, uint8_t len, uint8_t dst_reg, SPIDevice_t *target_device);
+bool spi_io_receive(SPIDevice_t *spid);
 
 #endif /* UTILS_SPI_IO_H_ */

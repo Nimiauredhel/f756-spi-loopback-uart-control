@@ -51,7 +51,7 @@ void serial_print_char(const char c)
 	HAL_UART_Transmit(&UART_PEER, (uint8_t *)&c, 1, HAL_MAX_DELAY);
 }
 
-uint8_t serial_scan(char *buffer, const uint8_t max_len)
+uint8_t serial_scan(char *buffer, const uint8_t max_len, const char min, const char max)
 {
 	uint8_t inchar = ' ';
 	uint8_t input_idx = 0;
@@ -80,7 +80,7 @@ uint8_t serial_scan(char *buffer, const uint8_t max_len)
 				serial_newline();
 				return input_idx+1;
 			default:
-				if (input_idx >= max_len)
+				if (input_idx >= max_len || inchar > max || inchar < min)
 				{
 					continue;
 				}

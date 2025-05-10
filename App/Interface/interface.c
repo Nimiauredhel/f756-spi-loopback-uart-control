@@ -13,17 +13,35 @@ inline static void clear_spi_states(volatile SPIDeviceState_t *cnt_state_ptr, vo
 	*tgt_state_ptr = SPISTATE_PENDING;
 }
 
-inline static void diff_spi_state_change(SPIDeviceState_t *old_state, SPIDeviceState_t *new_state, char *device_name)
+inline static bool diff_spi_state_change(SPIDeviceState_t *old_state, SPIDeviceState_t *new_state, char *device_name)
 {
 	SPIDeviceState_t delta = *new_state ^ *old_state;
+	bool error = false;
 
 	// if delta is zero then no changes have been detected and no action is necessary
 	// TODO: maybe also check if change is negative or positive, since both yield the same XOR result
 	if (delta != 0x00)
 	{
+		// CS line change
+		if (delta & SPISTATE_SELECTED)
+		{
+			serial_print(device_name, 0);
+			serial_print(" reports CS line: ", 0);
+
+			if (*new_state & SPISTATE_SELECTED)
+			{
+				serial_print_line("Falling Edge.", 0);
+			}
+			else
+			{
+				serial_print_line("Rising Edge.", 0);
+			}
+		}
+
 		// operation error
 		if (delta & SPISTATE_ERROR)
 		{
+			error = true;
 			serial_print(device_name, 0);
 			serial_print(" reports error during operation: ", 0);
 
@@ -96,10 +114,48 @@ inline static void diff_spi_state_change(SPIDeviceState_t *old_state, SPIDeviceS
 		// update old state to the new
 		*old_state = *new_state;
 	}
+
+	return error;
+}
+
+inline static void print_spi_error(uint8_t err_code, char *device_name)
+{
+	serial_print("Device ", 0);
+	serial_print(device_name, 0);
+	serial_print(" reported error: ", 0);
+
+	switch(err_code)
+	{
+	case HAL_SPI_ERROR_NONE:
+		serial_print_line("NONE", 0);
+		break;
+	case HAL_SPI_ERROR_ABORT:
+		serial_print_line("ABORT", 0);
+		break;
+	case HAL_SPI_ERROR_CRC:
+		serial_print_line("CRC", 0);
+		break;
+	case HAL_SPI_ERROR_DMA:
+		serial_print_line("DMA", 0);
+		break;
+	case HAL_SPI_ERROR_FLAG:
+		serial_print_line("FLAG", 0);
+		break;
+	case HAL_SPI_ERROR_FRE:
+		serial_print_line("FRE", 0);
+		break;
+	case HAL_SPI_ERROR_MODF:
+		serial_print_line("MODF", 0);
+		break;
+	case HAL_SPI_ERROR_OVR:
+		serial_print_line("OVR", 0);
+		break;
+	}
 }
 
 inline static void monitor_spi_operation(SPIDevice_t *cnt_device_ptr, SPIDevice_t *tgt_device_ptr)
 {
+	bool error = false;
 	SPIDeviceState_t cnt_prev_state = 0x00;
 	SPIDeviceState_t tgt_prev_state = 0x00;
 	SPIDeviceState_t cnt_curr_state = 0x00;
@@ -107,12 +163,14 @@ inline static void monitor_spi_operation(SPIDevice_t *cnt_device_ptr, SPIDevice_
 
 	do
 	{
-		HAL_Delay(10);
 		cnt_curr_state = cnt_device_ptr->state;
 		tgt_curr_state = tgt_device_ptr->state;
-		diff_spi_state_change(&cnt_prev_state, &cnt_curr_state, cnt_device_ptr->name);
-		diff_spi_state_change(&tgt_prev_state, &tgt_curr_state, tgt_device_ptr->name);
-	} while ((cnt_device_ptr->op + tgt_device_ptr->op) > SPIOP_NONE);
+		error = diff_spi_state_change(&cnt_prev_state, &cnt_curr_state, cnt_device_ptr->name);
+		if (error) print_spi_error(cnt_device_ptr->handle->ErrorCode, cnt_device_ptr->name);
+		error = diff_spi_state_change(&tgt_prev_state, &tgt_curr_state, tgt_device_ptr->name);
+		if (error) print_spi_error(tgt_device_ptr->handle->ErrorCode, tgt_device_ptr->name);
+	} while ((cnt_device_ptr->op + tgt_device_ptr->op) > SPIOP_NONE
+			|| tgt_curr_state & SPISTATE_SELECTED);
 }
 
 inline static void loopback_test_routine(SPI_HandleTypeDef *hspi_cnt, SPI_HandleTypeDef *hspi_tgt)
@@ -126,24 +184,20 @@ inline static void loopback_test_routine(SPI_HandleTypeDef *hspi_cnt, SPI_Handle
 	// clear the devices' state monitoring flags
 	clear_spi_states(&cnt_dev->state, &tgt_dev->state);
 
+	serial_print("Loopback test: ", 0);
+	serial_print(cnt_dev->name, 0);
+	serial_print("->", 2);
+	serial_print(tgt_dev->name, 0);
+	serial_print_line(".", 1);
+
 	/**
 	 * Prompt user and accept input test message.
 	 * The user input is stored in the controller device's TX buffer.
 	 * The allowed length is the buffer size minus one, to ensure a terminator.
 	 */
 	serial_print("Input test message: ", 0);
-	serial_scan(test_buff, sizeof(test_buff)-1);
-	serial_print_line(NULL, 0); // just a newline
-
-	/**
-	 * Enabling the target devices's CS line.
-	 * In this implementation this triggers an EXTI callback,
-	 * which in turn calls spi_io_receive() on the target SPI device.
-	 */
-	serial_print_line("Selecting Target SPI Device.", 0);
-	HAL_GPIO_WritePin(tgt_dev->cs_port_out, tgt_dev->cs_pin_out, GPIO_PIN_RESET);
-	HAL_Delay(10);
-
+	serial_scan(test_buff, sizeof(test_buff)-1, ASCII_PRINTABLE);
+	serial_print_line("--\r\n---", 7);
 	/**
 	 * Transmitting the input entered by the user.
 	 * The TX length is strlen+1 to always include a terminator,
@@ -151,18 +205,15 @@ inline static void loopback_test_routine(SPI_HandleTypeDef *hspi_cnt, SPI_Handle
 	 */
 	serial_print("Sending message: ", 0);
 	serial_print_line(test_buff, 0);
-	spi_io_transmit(hspi_cnt, (uint8_t *)test_buff, 1+strlen(test_buff));
+	spi_io_transmit(cnt_dev, (uint8_t *)test_buff, strlen(test_buff), 0, tgt_dev);
 
 	monitor_spi_operation(cnt_dev, tgt_dev);
 
 	serial_print("Received message: ", 0);
-	serial_print_line((char *)tgt_dev->rx_buff, 0);
-
-	serial_print_line("Deselecting Target SPI Device.", 0);
-	HAL_GPIO_WritePin(tgt_dev->cs_port_out, tgt_dev->cs_pin_out, GPIO_PIN_SET);
-	HAL_Delay(10);
-
-	serial_print_line("Loopback test concluded.", 0);
+	serial_print_line((char *)tgt_dev->regs[0], 0);
+	serial_print("Loopback test concluded.", 0);
+	serial_scan(test_buff, 0, ASCII_PRINTABLE);
+	serial_print_line("---", 3);
 }
 
 void interface_loop(void)
@@ -188,12 +239,12 @@ void interface_loop(void)
 	serial_print_line("-\r\nPlease select a test routine from the list:", 0);
 	serial_print_line("1: SPI Loopback Test (SPI1 <--> SPI3)", 0);
 	serial_print_line("2: SPI Loopback Test (SPI1 <--> SPI5)", 0);
-	serial_print_line("-", 1);
 
 	bzero(buff, sizeof(buff));
-	serial_scan(buff, 1);
+	serial_print("Your selection: [ ]\b\b", 0);
+	serial_scan(buff, 1, ASCII_NUMERIC);
 
-	serial_print_line("\r\n--", 4);
+	serial_print_line("-\r\n--", 5);
 
 	switch(buff[0])
 	{
@@ -205,8 +256,7 @@ void interface_loop(void)
 		break;
 	default:
 	serial_print_line("Invalid selection.", 0);
+	serial_print_line("--", 2);
 		break;
 	}
-
-	serial_print_line("--\r\n", 4);
 }

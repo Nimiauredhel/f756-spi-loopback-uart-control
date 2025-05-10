@@ -10,6 +10,28 @@
 static bool is_initialized = false;
 static SPIDevice_t devices[3] = {0};
 
+static void spi_io_process_rx(SPIDevice_t *spid)
+{
+	if (spid->rx_buff.header.tx_len > 0
+		&& spid->rx_buff.header.tx_reg < SPI_REG_COUNT)
+	{
+		memcpy((uint8_t *)spid->regs[spid->rx_buff.header.tx_reg],
+				(uint8_t *)spid->rx_buff.data, spid->rx_buff.header.tx_len);
+	}
+
+	spid->state |= SPISTATE_RX_CPLT;
+	spid->op &= ~SPIOP_RX;
+
+	if (spid->rx_buff.header.rx_len > 0
+		&& spid->rx_buff.header.rx_reg < SPI_REG_COUNT)
+	{
+		spi_io_transmit(spid,
+				(uint8_t *)spid->regs[spid->rx_buff.header.rx_reg],
+				spid->rx_buff.header.rx_len,
+				spid->rx_buff.header.rx_reg, NULL);
+	}
+}
+
 bool spi_io_is_initialized(void)
 {
 	return is_initialized;
@@ -44,8 +66,6 @@ void spi_io_initialize(void)
 
 SPIDevice_t* hspi_to_struct(SPI_HandleTypeDef *hspi)
 {
-	if (!is_initialized) return NULL;
-
 	if (hspi == &hspi1) return devices+0;
 	if (hspi == &hspi3) return devices+1;
 	if (hspi == &hspi5) return devices+2;
@@ -53,13 +73,11 @@ SPIDevice_t* hspi_to_struct(SPI_HandleTypeDef *hspi)
 	return NULL;
 }
 
-bool spi_io_transmit(SPI_HandleTypeDef *hspi, uint8_t *data, uint8_t len)
+bool spi_io_transmit(SPIDevice_t *spid, uint8_t *data, uint8_t len, uint8_t dst_reg, SPIDevice_t *target_device)
 {
 	if (len < 1) return false;
 
-	SPIDevice_t *spid = hspi_to_struct(hspi);
-
-	if (spid == NULL) return false;
+	if (dst_reg >= SPI_REG_COUNT) return false;
 
 	if (spid->op & SPIOP_TX)
 	{
@@ -74,26 +92,45 @@ bool spi_io_transmit(SPI_HandleTypeDef *hspi, uint8_t *data, uint8_t len)
 	spid->state |= SPISTATE_TX_PENDING;
 	spid->op |= SPIOP_TX;
 
-	if (len > SPI_BUFF_SIZE) len = SPI_BUFF_SIZE;
+	if (len > SPI_DATA_MAX_LEN) len = SPI_DATA_MAX_LEN;
+
+	bzero((uint8_t *)&spid->tx_buff, sizeof(SPIPacket_t));
+	memset((uint8_t *)spid->tx_buff.header.pad_head, 255u, 2);
+	memset((uint8_t *)spid->tx_buff.header.pad_tail, 255u, 1);
+	spid->tx_buff.header.opcode = SPIOP_TX;
+	spid->tx_buff.header.tx_len = len;
+	spid->tx_buff.header.tx_reg = dst_reg;
+	spid->tx_buff.header.rx_len = 0u;
+	spid->tx_buff.header.rx_reg = 0u;
+	memcpy((uint8_t *)spid->tx_buff.data, data, len);
 
 	spid->tx_pos = 0;
-	spid->tx_len = len;
 
-	bzero(spid->tx_buff, SPI_BUFF_SIZE);
-	memcpy(spid->tx_buff, data, len);
-	HAL_SPI_Transmit_IT(spid->handle, spid->tx_buff, 1);
+	// the target device is only set when a Controller is transmitting,
+	// since it is only used for controlling the CS line
+	if (target_device != NULL)
+	{
+		/**
+		 * Enabling the target devices's CS line.
+		 * In this implementation this triggers an EXTI callback,
+		 * which in turn calls spi_io_receive() on the target SPI device.
+		 */
+		spid->target_device = target_device;
+		serial_print_line("Selecting Target SPI Device.", 0);
+		// making sure that the CS line is low first
+		HAL_GPIO_WritePin(spid->target_device->cs_port_out, target_device->cs_pin_out, GPIO_PIN_SET);
+		HAL_Delay(100);
+		HAL_GPIO_WritePin(spid->target_device->cs_port_out, target_device->cs_pin_out, GPIO_PIN_RESET);
+	}
+
+	HAL_SPI_Transmit_IT(spid->handle, (uint8_t *)&spid->tx_buff.header,
+			sizeof(SPIHeader_t));
 
 	return true;
 }
 
-bool spi_io_receive(SPI_HandleTypeDef *hspi, uint8_t max_len)
+bool spi_io_receive(SPIDevice_t *spid)
 {
-	if (max_len < 1) return false;
-
-	SPIDevice_t *spid = hspi_to_struct(hspi);
-
-	if (spid == NULL) return false;
-
 	if (spid->op & SPIOP_RX)
 	{
 		/*
@@ -107,13 +144,9 @@ bool spi_io_receive(SPI_HandleTypeDef *hspi, uint8_t max_len)
 	spid->state |= SPISTATE_RX_PENDING;
 	spid->op |= SPIOP_RX;
 
-	if (max_len > SPI_BUFF_SIZE) max_len = SPI_BUFF_SIZE;
-
 	spid->rx_pos = 0;
-	spid->rx_len = max_len;
 
-	bzero(spid->rx_buff, SPI_BUFF_SIZE);
-	HAL_SPI_Receive_IT(spid->handle, spid->rx_buff, 1);
+	HAL_SPI_Receive_IT(spid->handle, (uint8_t *)&spid->rx_buff, sizeof(SPIHeader_t));
 
 	return true;
 }
@@ -124,20 +157,20 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 	if (GPIO_Pin == SPI3_CS_IN_Pin
 	 || GPIO_Pin == SPI5_CS_IN_Pin)
 	{
-		if (!is_initialized) return;
-
 		SPIDevice_t *spid = hspi_to_struct(
 				GPIO_Pin == SPI3_CS_IN_Pin ? &hspi3 : &hspi5);
 
 		if (spid == NULL) return;
 
-		GPIO_PinState edge = HAL_GPIO_ReadPin(spid->cs_port_in, spid->cs_pin_in);
-
 		// falling edge - selected
-		if (edge == GPIO_PIN_RESET)
+		if (HAL_GPIO_ReadPin(spid->cs_port_in, spid->cs_pin_in) == GPIO_PIN_RESET)
 		{
 			spid->state |= SPISTATE_SELECTED;
-			spi_io_receive(spid->handle, SPI_BUFF_SIZE);
+
+			if (spid->op == SPIOP_NONE)
+			{
+				spi_io_receive(spid);
+			}
 		}
 		// rising edge - deselected
 		else
@@ -147,7 +180,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 	}
 }
 
-void HAL_SPI_ErrorCpltCallback(SPI_HandleTypeDef *hspi)
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 {
 	if (!is_initialized) return;
 
@@ -165,38 +198,48 @@ void HAL_SPI_AbortCpltCallback(SPI_HandleTypeDef *hspi)
 
 void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
 {
-	if (!is_initialized) return;
-
 	SPIDevice_t *spid = hspi_to_struct(hspi);
 
-
-	if (spid->tx_pos+1 >= spid->tx_len)
+	if (spid->tx_pos == 0)
 	{
-		spid->state |= SPISTATE_TX_CPLT;
-		spid->op &= ~SPIOP_TX;
+		spid->tx_pos = 1;
+		HAL_SPI_Transmit_IT(spid->handle, (uint8_t *)spid->tx_buff.data,
+				spid->tx_buff.header.tx_len);
 	}
 	else
 	{
-		spid->tx_pos++;
-		HAL_SPI_Transmit_IT(spid->handle, spid->tx_buff+spid->tx_pos, 1);
+		// If this is a Controller callback,
+		// deselect the Target device.
+		// TODO: check here if we sent an Rx request,
+		//       in which case, we immediately transition to Rx mode
+		if (spid->target_device != NULL)
+		{
+			HAL_GPIO_WritePin(spid->target_device->cs_port_out,
+				spid->target_device->cs_pin_out, GPIO_PIN_SET);
+			spid->target_device = NULL;
+		}
+
+		HAL_Delay(2);
+
+		spid->state |= SPISTATE_TX_CPLT;
+		spid->op &= ~SPIOP_TX;
 	}
 }
 
 void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
 {
-	if (!is_initialized) return;
-
 	SPIDevice_t *spid = hspi_to_struct(hspi);
 
-	if (spid->rx_pos+1 >= spid->rx_len
-		|| spid->rx_buff[spid->rx_pos] == '\0')
+	if (spid->rx_pos == 0)
 	{
-		spid->state |= SPISTATE_RX_CPLT;
-		spid->op &= ~SPIOP_RX;
+		spid->rx_pos = 1;
+		HAL_SPI_Receive_IT(spid->handle,
+			(uint8_t *)spid->rx_buff.data,
+			spid->rx_buff.header.tx_len);
 	}
 	else
 	{
-		spid->rx_pos++;
-		HAL_SPI_Receive_IT(spid->handle, spid->rx_buff+spid->rx_pos, 1);
+		spi_io_process_rx(spid);
 	}
+
 }
