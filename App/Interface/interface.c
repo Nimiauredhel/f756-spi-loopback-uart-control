@@ -237,8 +237,8 @@ void interface_loop(void)
 	}
 
 	serial_print_line("-\r\nPlease select a test routine from the list:", 0);
-	serial_print_line("1: SPI Loopback Test (SPI1 <--> SPI3)", 0);
-	serial_print_line("2: SPI Loopback Test (SPI1 <--> SPI5)", 0);
+	serial_print_line("1: SPI Half-Duplex Loopback Test (SPI1->SPI3)", 0);
+	serial_print_line("2: SPI Half-Duplex Loopback Test (SPI1->SPI5)", 0);
 
 	bzero(buff, sizeof(buff));
 	serial_print("Your selection: [ ]\b\b", 0);
